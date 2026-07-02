@@ -9,6 +9,10 @@
 
 This is part of the [MacromNex](https://github.com/MacromNex) ecosystem.
 
+> [!NOTE]
+> This repository is a fork of the original [ProteinMCP](https://github.com/charlesxu90/ProteinMCP) framework, updated to support Google Gemini and OpenAI models via the Goose CLI agent. You can read the original study published in *Protein Science* here: [ProteinMCP: An agentic AI framework for autonomous protein engineering](https://onlinelibrary.wiley.com/doi/full/10.1002/pro.70547).
+
+
 ## Prerequisites
 
 The following tools must be installed on your system:
