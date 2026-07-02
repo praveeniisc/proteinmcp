@@ -21,7 +21,8 @@ The following tools must be installed on your system:
 |------|---------|---------------|
 | **Python 3.10+** | Core runtime | [python.org](https://www.python.org/downloads/) |
 | **Conda/Mamba** | Environment management | [miniforge](https://github.com/conda-forge/miniforge) |
-| **Node.js / npm** | Claude Code CLI | [nodejs.org](https://nodejs.org/) |
+| **Node.js / npm** | Claude Code CLI (optional) | [nodejs.org](https://nodejs.org/) |
+| **Goose CLI** | Multi-model CLI agent (optional) | [Goose Installation](https://block.github.io/goose/docs/installation/) |
 | **Docker** (with GPU support) | Containerized MCP servers | [docs.docker.com](https://docs.docker.com/get-docker/) |
 | **NVIDIA drivers + nvidia-container-toolkit** | GPU access in Docker | [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) |
 
@@ -46,13 +47,31 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-### Step 2 — Install Claude Code CLI
+### Step 2 — Install Your Preferred CLI Agent
 
+Depending on whether you want to use Anthropic's Claude Code CLI or other models like Google Gemini or OpenAI (via Goose), install the appropriate tool:
+
+#### Option 2A: Claude Code CLI (Claude models only)
 ```bash
 npm install -g @anthropic-ai/claude-code
 ```
 
-### Step 3 — Verify the installation
+#### Option 2B: Install Goose CLI (Gemini, OpenAI, etc.)
+```bash
+# Install Goose CLI
+pipx install goose-ai
+# Or install via npm/Homebrew according to Goose docs
+```
+
+### Step 3 — Configure LLM API Keys (For Goose/Gemini/OpenAI)
+
+If you are using Option 2B (Goose CLI), run the interactive configuration command to set up your preferred provider and API credentials:
+```bash
+pmcp configure
+```
+Follow the prompts to select your provider (`google` or `openai`), input your API key (which will be validated in real-time), and select your default model (e.g. `gemini-1.5-flash` or `gpt-4o-mini`).
+
+### Step 4 — Verify the installation
 
 ```bash
 pmcp avail     # List all available MCPs
@@ -85,12 +104,16 @@ cd tool-mcps/bindcraft_mcp && docker build -t bindcraft_mcp:latest . && cd ../..
 cd tool-mcps/boltzgen_mcp && docker build -t boltzgen_mcp:latest . && cd ../..
 ```
 
-Then register with Claude Code:
+Then register with your active CLI (dynamic resolution defaults to your configured provider, or specify explicitly):
 ```bash
 # pmcp install detects the local image and skips pulling from registry
+# Registers with your configured CLI (Goose or Claude)
 pmcp install esm_mcp
 pmcp install prottrans_mcp
-# ... etc
+
+# Or specify CLI explicitly:
+pmcp install esm_mcp --cli goose
+pmcp install esm_mcp --cli claude
 ```
 
 **Alternative: auto-install** (pulls from registry if no local image):
@@ -106,25 +129,38 @@ pmcp install msa_mcp         # Runs quick_setup.sh, creates local venv
 ### Verify installed MCPs
 ```bash
 pmcp status                  # Shows installed/registered status
+# For Claude Code:
 claude mcp list              # Health-check all registered MCPs
+# For Goose:
+goose info                   # Show active extensions
 ```
 
 ## Quick Start
 
 ### Option A — Workflow Skills (recommended)
 
-Skills are guided workflows that orchestrate multiple MCP servers via Claude Code.
+Skills are guided workflows that orchestrate multiple MCP servers via Claude Code or Goose CLI.
 
+#### For Claude Code CLI (Claude models only):
 ```bash
 # Install a workflow (auto-installs all required MCPs)
-pskill install fitness_modeling
+pskill install fitness_modeling --cli claude
 
 # Launch Claude Code and run the skill
 claude
 > /fitness-model
 ```
 
-Claude will prompt you for inputs (protein name, data location, etc.) and execute the full pipeline.
+#### For Goose CLI (Gemini, OpenAI, etc.):
+```bash
+# Install a workflow (auto-registers MCPs in Goose config.yaml)
+pskill install fitness_modeling --cli goose
+
+# Run the skill interactively (pre-loads instructions in a new Goose session)
+pskill run fitness_modeling
+```
+
+Goose/Claude will prompt you for inputs (protein name, data location, etc.) and execute the full pipeline.
 
 **Available skills:**
 
