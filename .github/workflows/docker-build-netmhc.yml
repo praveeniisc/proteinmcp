@@ -1,0 +1,70 @@
+name: Build NetMHC Docker Images
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'tool-mcps/netmhc*_mcp/**'
+      - '.github/workflows/docker-build-netmhc.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'tool-mcps/netmhc*_mcp/**'
+  workflow_dispatch:
+
+jobs:
+  build-netmhcpan:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache downloaded NetMHCpan binaries for faster builds
+      # The Docker build will download from official source and cache locally
+      - name: Cache NetMHCpan binaries
+        uses: actions/cache@v3
+        with:
+          path: tool-mcps/netmhcpan_mcp/repo/netMHCpan-4.2
+          key: netmhcpan-4.2-v1
+          restore-keys: netmhcpan-4.2-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build netmhcpan_mcp Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./tool-mcps/netmhcpan_mcp
+          push: false
+          tags: netmhcpan_mcp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-netmhc2pan:
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # Cache downloaded NetMHCIIpan binaries for faster builds
+      # The Docker build will download from official source and cache locally
+      - name: Cache NetMHCIIpan binaries
+        uses: actions/cache@v3
+        with:
+          path: tool-mcps/netmhc2pan_mcp/repo/netMHCIIpan-4.3
+          key: netmhc2pan-4.3-v1
+          restore-keys: netmhc2pan-4.3-
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build netmhc2pan_mcp Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./tool-mcps/netmhc2pan_mcp
+          push: false
+          tags: netmhc2pan_mcp:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

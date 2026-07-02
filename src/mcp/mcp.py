@@ -1,0 +1,1138 @@
+#!/usr/bin/env python3
+"""
+MCP Class - Represents a single MCP server with installation and registration operations
+"""
+
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Optional, Dict, Any, List
+from dataclasses import dataclass, field, asdict
+from enum import Enum
+
+
+# =============================================================================
+# Constants and Path Configuration
+# =============================================================================
+
+SCRIPT_DIR = Path(__file__).parent.resolve()  # src/mcp/
+SRC_DIR = SCRIPT_DIR.parent  # src/
+PROJECT_ROOT = SRC_DIR.parent  # ProteinMCP root
+CONFIGS_DIR = SCRIPT_DIR / "configs"
+PUBLIC_MCPS_CONFIG = CONFIGS_DIR / "public_mcps.yaml"
+MCPS_CONFIG = CONFIGS_DIR / "mcps.yaml"
+TOOL_MCPS_DIR = PROJECT_ROOT / "tool-mcps"
+PUBLIC_MCPS_DIR = TOOL_MCPS_DIR / "public"
+
+
+def resolve_path(path_str: str) -> Path:
+    """
+    Resolve a path that may be relative to PROJECT_ROOT.
+
+    Args:
+        path_str: Path string (absolute or relative to PROJECT_ROOT)
+
+    Returns:
+        Absolute Path object
+    """
+    path = Path(path_str)
+    if path.is_absolute():
+        return path
+    return (PROJECT_ROOT / path).resolve()
+
+
+def make_relative_path(abs_path: str) -> str:
+    """
+    Convert an absolute path to a relative path from PROJECT_ROOT.
+
+    Args:
+        abs_path: Absolute path string
+
+    Returns:
+        Relative path string if under PROJECT_ROOT, otherwise original path
+    """
+    try:
+        path = Path(abs_path)
+        if path.is_absolute():
+            rel_path = path.relative_to(PROJECT_ROOT)
+            return str(rel_path)
+    except ValueError:
+        pass
+    return abs_path
+
+
+# =============================================================================
+# Enums
+# =============================================================================
+
+class MCPRuntime(Enum):
+    """MCP runtime types"""
+    PYTHON = "python"
+    NODE = "node"
+    UVX = "uvx"
+    NPX = "npx"
+    BINARY = "binary"
+    DOCKER = "docker"
+
+
+class MCPScope(Enum):
+    """MCP registration scope"""
+    PROJECT = "project"
+    GLOBAL = "global"
+
+
+class MCPStatus(Enum):
+    """MCP installation status"""
+    NOT_INSTALLED = "not_installed"
+    INSTALLED = "installed"
+    REGISTERED = "registered"
+    BOTH = "both"  # installed and registered
+
+
+# =============================================================================
+# MCP Class - Represents a single MCP server
+# =============================================================================
+
+@dataclass
+class MCP:
+    """
+    Represents a single MCP server with full lifecycle operations.
+
+    Attributes:
+        name: MCP identifier
+        url: Repository URL
+        description: Brief description
+        source: Source organization
+        runtime: Runtime type (python, node, uvx, npx, binary)
+        setup_commands: Commands to run after cloning
+        setup_script: Shell script for setup (e.g., quick_setup.sh)
+        server_command: Command to start the server
+        server_args: Arguments for the server command
+        env_vars: Environment variables needed
+        dependencies: System dependencies required
+        path: Local installation path (if installed)
+        python_version: Python version requirement (e.g., "3.10")
+    """
+
+    name: str
+    url: str = ""
+    description: str = ""
+    source: str = "Community"
+    runtime: str = "python"
+    setup_commands: List[str] = field(default_factory=list)
+    setup_script: Optional[str] = None
+    server_command: str = ""
+    server_args: List[str] = field(default_factory=list)
+    env_vars: Dict[str, str] = field(default_factory=dict)
+    dependencies: List[str] = field(default_factory=list)
+    path: Optional[str] = None
+    python_version: Optional[str] = None
+    docker_image: Optional[str] = None
+    docker_args: List[str] = field(default_factory=list)
+    docker_volumes: List[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        """Validate and normalize runtime type"""
+        try:
+            MCPRuntime(self.runtime)
+        except ValueError:
+            # Default to python if invalid
+            self.runtime = MCPRuntime.PYTHON.value
+
+    # -------------------------------------------------------------------------
+    # Status Query Methods
+    # -------------------------------------------------------------------------
+
+    def is_installed(self) -> bool:
+        """Check if MCP is installed locally"""
+        if self.path:
+            path = resolve_path(self.path)
+            return path.exists()
+
+        # Check in default locations
+        if self.runtime in [MCPRuntime.UVX.value, MCPRuntime.NPX.value]:
+            # Package-based MCPs don't need local installation
+            return True
+
+        if self.runtime == MCPRuntime.DOCKER.value:
+            if not self.docker_image:
+                return False
+            # Prefer local image (e.g. bindcraft_mcp:latest) over registry image
+            local_image = self._get_local_docker_image()
+            if local_image and self._check_docker_image_exists(local_image):
+                return True
+            return self._check_docker_image_exists(self.docker_image)
+
+        # Check in public MCPs directory
+        if self.url:
+            repo_name = self.url.rstrip("/").split("/")[-1]
+            cloned_path = PUBLIC_MCPS_DIR / repo_name
+            if cloned_path.exists():
+                self.path = str(cloned_path)
+                return True
+
+        return False
+
+    def is_registered(self, cli: str = "claude") -> bool:
+        """
+        Check if MCP is registered with specified CLI.
+
+        Args:
+            cli: CLI tool name (claude or gemini)
+
+        Returns:
+            True if registered, False otherwise
+        """
+        clean_name = self._get_clean_name()
+
+        try:
+            if cli == "claude":
+                result = subprocess.run(
+                    ["claude", "mcp", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30  # Increased timeout for health checks
+                )
+                return clean_name in result.stdout
+
+            elif cli == "gemini":
+                result = subprocess.run(
+                    ["gemini", "mcp", "list"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30  # Increased timeout for health checks
+                )
+                return clean_name in result.stdout
+
+            elif cli == "goose":
+                import yaml
+                goose_config_path = Path.home() / ".config" / "goose" / "config.yaml"
+                if not goose_config_path.exists():
+                    return False
+                try:
+                    with open(goose_config_path, "r") as f:
+                        config = yaml.safe_load(f) or {}
+                    extensions = config.get("extensions", {})
+                    return clean_name in extensions
+                except Exception:
+                    return False
+
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+        return False
+
+    def get_status(self, cli: str = "claude", use_cache: bool = True) -> MCPStatus:
+        """
+        Get overall status of MCP.
+
+        Args:
+            cli: CLI tool to check registration against
+            use_cache: If True, use cached status when available (default: True)
+
+        Returns:
+            MCPStatus enum value
+        """
+        # Try cache first if enabled
+        if use_cache:
+            from .status_cache import get_cache
+            cache = get_cache()
+            cached_status = cache.get_status(f"{self.name}:{cli}")
+            if cached_status:
+                try:
+                    return MCPStatus(cached_status)
+                except ValueError:
+                    pass  # Invalid cached value, fall through to real check
+
+        # Perform real status check
+        installed = self.is_installed()
+        registered = self.is_registered(cli)
+
+        if installed and registered:
+            status = MCPStatus.BOTH
+        elif registered:
+            status = MCPStatus.REGISTERED
+        elif installed:
+            status = MCPStatus.INSTALLED
+        else:
+            status = MCPStatus.NOT_INSTALLED
+
+        # Update cache
+        if use_cache:
+            from .status_cache import get_cache
+            cache = get_cache()
+            cache.set_status(f"{self.name}:{cli}", status.value)
+
+        return status
+
+    def invalidate_status_cache(self, cli: str = "claude"):
+        """
+        Invalidate cached status for this MCP.
+
+        Args:
+            cli: CLI tool to invalidate cache for
+        """
+        from .status_cache import get_cache
+        cache = get_cache()
+        # Read cache, remove this MCP's status, and write back
+        cache_data = cache.read_cache()
+        statuses = cache_data.get("statuses", {})
+        key = f"{self.name}:{cli}"
+        if key in statuses:
+            del statuses[key]
+            cache.write_cache(statuses)
+
+    # -------------------------------------------------------------------------
+    # Installation Methods
+    # -------------------------------------------------------------------------
+
+    def install(self, force: bool = False, capture_output: bool = False) -> bool:
+        """
+        Install MCP to local machine.
+
+        Args:
+            force: If True, re-install even if already installed
+            capture_output: If True, capture setup script output (for parallel execution)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Invalidate status cache to ensure fresh status check
+        # (in case claude mcp remove was called directly)
+        self.invalidate_status_cache()
+
+        # Check if already installed
+        if self.is_installed() and not force:
+            if self.runtime == MCPRuntime.DOCKER.value:
+                print(f"✅ MCP '{self.name}' Docker image already pulled: {self.docker_image}")
+            else:
+                print(f"✅ MCP '{self.name}' is already installed at: {self.path}")
+            return True
+
+        # Package-based MCPs don't need installation
+        if self.runtime in [MCPRuntime.UVX.value, MCPRuntime.NPX.value]:
+            print(f"✅ MCP '{self.name}' is a {self.runtime} package (no installation needed)")
+            self.invalidate_status_cache()
+            return True
+
+        if self.runtime == MCPRuntime.DOCKER.value:
+            return self._pull_docker_image(capture_output=capture_output)
+
+        # Handle local tool MCPs (check if already present in tool-mcps directory)
+        if self.path:
+            local_path = resolve_path(self.path)
+
+            # If local path exists, use it (even if URL is provided)
+            if local_path.exists():
+                # Keep path as-is (may be relative) for portability
+                print(f"📁 Found local MCP '{self.name}' at: {local_path}")
+
+                # Invalidate cache since installation state may have changed
+                self.invalidate_status_cache()
+
+                # Run setup (script or commands)
+                return self._run_setup(capture_output=capture_output)
+
+            # If local path doesn't exist but URL is provided, fall through to clone
+            elif self.url:
+                print(f"📦 Local path not found at {local_path}, will clone from GitHub...")
+            # If no URL and path doesn't exist, error
+            else:
+                print(f"❌ Local MCP path does not exist: {local_path}")
+                return False
+
+        # Clone repository for public/tool MCPs
+        if not self.url:
+            print(f"❌ No URL provided for MCP '{self.name}'")
+            return False
+
+        # Determine target path for cloning
+        if self.path:
+            # If path is specified, clone to that location
+            target_path = resolve_path(self.path)
+        else:
+            # Default: clone to public MCPs directory
+            repo_name = self.url.rstrip("/").split("/")[-1]
+            PUBLIC_MCPS_DIR.mkdir(parents=True, exist_ok=True)
+            target_path = PUBLIC_MCPS_DIR / repo_name
+
+        # Handle existing installation
+        if target_path.exists():
+            if force:
+                print(f"🗑️  Removing existing installation at: {target_path}")
+                shutil.rmtree(target_path)
+            else:
+                print(f"📁 MCP '{self.name}' already exists at: {target_path}")
+                self.path = str(target_path)
+                return True
+
+        # Create parent directory if it doesn't exist
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Clone repository
+        print(f"📦 Cloning {self.name} from {self.source}...")
+        print(f"   URL: {self.url}")
+        print(f"   Destination: {target_path}")
+
+        try:
+            result = subprocess.run(
+                ["git", "clone", self.url, str(target_path)],
+                capture_output=True,
+                text=True,
+                timeout=300
+            )
+
+            if result.returncode != 0:
+                print(f"❌ Git clone failed: {result.stderr}")
+                return False
+
+            self.path = str(target_path)
+            print(f"✅ Successfully cloned {self.name}")
+
+            # Invalidate cache since installation state changed
+            self.invalidate_status_cache()
+
+            # Run setup (script or commands)
+            return self._run_setup(capture_output=capture_output)
+
+        except FileNotFoundError:
+            print("❌ Git not found. Please install git first.")
+            return False
+        except subprocess.TimeoutExpired:
+            print("❌ Clone timed out (exceeded 5 minutes)")
+            return False
+        except Exception as e:
+            print(f"❌ Clone failed: {e}")
+            return False
+
+    def uninstall(self, remove_files: bool = True) -> bool:
+        """
+        Uninstall MCP from local machine.
+
+        Args:
+            remove_files: If True, remove installation files
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.is_installed():
+            print(f"⚠️  MCP '{self.name}' is not installed")
+            return True
+
+        # Package-based and Docker MCPs don't have local files
+        if self.runtime in [MCPRuntime.UVX.value, MCPRuntime.NPX.value, MCPRuntime.DOCKER.value]:
+            print(f"✅ MCP '{self.name}' is a {self.runtime} package (no files to remove)")
+            self.path = None
+            # Invalidate cache since uninstall state changed
+            self.invalidate_status_cache()
+            return True
+
+        # Remove installation directory
+        if remove_files and self.path:
+            try:
+                path = resolve_path(self.path)
+                if path.exists():
+                    print(f"🗑️  Removing {path}...")
+                    shutil.rmtree(path)
+                    print(f"✅ Successfully removed {self.name}")
+                self.path = None
+                # Invalidate cache since uninstall state changed
+                self.invalidate_status_cache()
+                return True
+            except Exception as e:
+                print(f"❌ Failed to remove files: {e}")
+                return False
+
+        return True
+
+    def _get_local_docker_image(self) -> str | None:
+        """Derive local image name from the GHCR docker_image.
+
+        For example, 'ghcr.io/macromnex/bindcraft_mcp:latest' -> 'bindcraft_mcp:latest'.
+        Returns None if docker_image is not set or not a registry path.
+        """
+        if not self.docker_image:
+            return None
+        # If the image already has no registry prefix, it IS the local name
+        if "/" not in self.docker_image:
+            return None
+        # Extract the image name (last segment) from the full path
+        return self.docker_image.split("/")[-1]
+
+    def _check_docker_image_exists(self, image: str) -> bool:
+        """Check if a Docker image exists locally."""
+        try:
+            result = subprocess.run(
+                ["docker", "image", "inspect", image],
+                capture_output=True, text=True, timeout=10
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def _resolve_docker_image(self) -> str | None:
+        """Resolve which Docker image to use, preferring local over registry.
+
+        Returns the image name to use, or None if no image is available.
+        """
+        # Try local image first (e.g. bindcraft_mcp:latest)
+        local_image = self._get_local_docker_image()
+        if local_image and self._check_docker_image_exists(local_image):
+            return local_image
+        # Fall back to the full registry image (e.g. ghcr.io/macromnex/bindcraft_mcp:latest)
+        if self.docker_image and self._check_docker_image_exists(self.docker_image):
+            return self.docker_image
+        return None
+
+    def _pull_docker_image(self, capture_output: bool = False) -> bool:
+        """Pull Docker image for Docker-based MCP.
+
+        Prefers local images (e.g. bindcraft_mcp:latest) over registry images.
+        Only pulls from the registry if no local image is found.
+
+        Args:
+            capture_output: If True, capture output instead of streaming (for parallel execution).
+        """
+        if not self.docker_image:
+            print(f"❌ No docker_image specified for '{self.name}'")
+            return False
+
+        # Check for local image first (e.g. bindcraft_mcp:latest)
+        local_image = self._get_local_docker_image()
+        if local_image and self._check_docker_image_exists(local_image):
+            print(f"✅ Found local Docker image: {local_image}")
+            self.invalidate_status_cache()
+            return True
+
+        # Check if the full registry image already exists locally
+        if self._check_docker_image_exists(self.docker_image):
+            print(f"✅ Docker image already available: {self.docker_image}")
+            self.invalidate_status_cache()
+            return True
+
+        # Pull from registry
+        print(f"🐳 Pulling Docker image: {self.docker_image}")
+        try:
+            result = subprocess.run(
+                ["docker", "pull", self.docker_image],
+                capture_output=capture_output, text=True, timeout=1800
+            )
+            if result.returncode != 0:
+                if capture_output and result.stderr:
+                    print(f"  [{self.name}] {result.stderr.strip()}")
+                print(f"❌ Docker pull failed for {self.docker_image}")
+                return False
+            if capture_output and result.stdout:
+                for line in result.stdout.strip().splitlines():
+                    print(f"  [{self.name}] {line}")
+            print(f"✅ Successfully pulled {self.docker_image}")
+            self.invalidate_status_cache()
+            return True
+        except FileNotFoundError:
+            print("❌ Docker not found. Please install Docker first.")
+            return False
+        except subprocess.TimeoutExpired:
+            print("❌ Docker pull timed out (exceeded 30 minutes)")
+            return False
+
+    def _run_setup_script(self, capture_output: bool = False) -> bool:
+        """
+        Run the setup_script (e.g., quick_setup.sh) if available.
+
+        Args:
+            capture_output: If True, capture output instead of streaming (for parallel execution).
+                           Captured output is printed at the end to avoid interleaving.
+
+        Returns:
+            True if successful or no script exists, False on failure
+        """
+        if not self.path or not self.setup_script:
+            return False
+
+        cwd = resolve_path(self.path)
+        script_path = cwd / self.setup_script
+
+        if not script_path.exists():
+            print(f"⚠️  Setup script not found: {script_path}")
+            return False
+
+        print(f"📦 Running setup script: {self.setup_script}")
+
+        try:
+            # Make the script executable
+            import os
+            os.chmod(script_path, 0o755)
+
+            if capture_output:
+                # Thread-safe: capture output and print at the end
+                result = subprocess.run(
+                    ["bash", str(script_path)],
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    timeout=1800  # 30 minutes timeout for complex setups
+                )
+
+                # Print captured output with MCP name prefix for clarity
+                if result.stdout:
+                    for line in result.stdout.splitlines():
+                        print(f"  [{self.name}] {line}")
+                if result.stderr:
+                    for line in result.stderr.splitlines():
+                        print(f"  [{self.name}] {line}")
+            else:
+                # Real-time output (default for sequential execution)
+                result = subprocess.run(
+                    ["bash", str(script_path)],
+                    cwd=str(cwd),
+                    capture_output=False,
+                    timeout=1800  # 30 minutes timeout for complex setups
+                )
+
+            if result.returncode != 0:
+                print(f"⚠️  Setup script failed with exit code: {result.returncode}")
+                return False
+
+            print(f"✅ Setup script completed successfully")
+            return True
+
+        except subprocess.TimeoutExpired:
+            print(f"⚠️  Setup script timed out (exceeded 30 minutes)")
+            return False
+        except Exception as e:
+            print(f"⚠️  Setup script error: {e}")
+            return False
+
+    def _run_setup_commands(self) -> bool:
+        """Run setup commands after installation"""
+        if not self.path:
+            return False
+
+        # Resolve path to absolute for command execution
+        cwd = resolve_path(self.path)
+        print(f"📦 Running setup commands for {self.name}...")
+
+        for cmd in self.setup_commands:
+            print(f"   Running: {cmd}")
+            try:
+                result = subprocess.run(
+                    cmd,
+                    shell=True,
+                    cwd=str(cwd),
+                    capture_output=True,
+                    text=True,
+                    timeout=600
+                )
+
+                if result.returncode != 0:
+                    print(f"⚠️  Setup command failed: {result.stderr}")
+                    print(f"   You may need to run this manually: {cmd}")
+                    # Continue with other commands
+                else:
+                    print(f"   ✅ {cmd}")
+
+            except subprocess.TimeoutExpired:
+                print(f"⚠️  Setup command timed out: {cmd}")
+                return False
+            except Exception as e:
+                print(f"⚠️  Setup command error: {e}")
+                return False
+
+        return True
+
+    def _run_setup(self, capture_output: bool = False) -> bool:
+        """
+        Run setup using setup_script if available, otherwise fall back to setup_commands.
+
+        Args:
+            capture_output: If True, capture output instead of streaming (for parallel execution).
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # First, try to run setup_script (e.g., quick_setup.sh)
+        if self.setup_script:
+            cwd = resolve_path(self.path) if self.path else None
+            if cwd and (cwd / self.setup_script).exists():
+                print(f"🔧 Found setup script: {self.setup_script}")
+                if self._run_setup_script(capture_output=capture_output):
+                    return True
+                else:
+                    print("⚠️  Setup script failed, falling back to setup commands...")
+
+        # Fall back to setup_commands
+        if self.setup_commands:
+            return self._run_setup_commands()
+
+        # No setup needed
+        print("ℹ️  No setup script or commands configured")
+        return True
+
+    # -------------------------------------------------------------------------
+    # Registration Methods
+    # -------------------------------------------------------------------------
+
+    def register(self, cli: str = "claude", scope: MCPScope = MCPScope.GLOBAL) -> bool:
+        """
+        Register MCP with specified CLI.
+
+        Args:
+            cli: CLI tool (claude or gemini)
+            scope: Registration scope (project or global) - currently not implemented
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # Note: scope parameter is reserved for future use
+        _ = scope  # Silence unused parameter warning
+        clean_name = self._get_clean_name()
+
+        # Check CLI availability
+        if cli != "goose" and not shutil.which(cli):
+            print(f"❌ {cli} CLI not found. Please install it first.")
+            return False
+        elif cli == "goose":
+            if not shutil.which("goose"):
+                print("⚠️  Warning: 'goose' binary not found in PATH. Make sure Goose is installed.")
+
+        # Check if already registered
+        if self.is_registered(cli):
+            print(f"⚠️  MCP '{clean_name}' already registered with {cli}")
+            response = input("   Update registration? [y/N]: ").strip().lower()
+            if response != "y":
+                return True
+            # Unregister first
+            self.unregister(cli)
+
+        print(f"\n🔧 Registering '{clean_name}' with {cli}...")
+
+        if cli == "goose":
+            return self._register_goose(clean_name)
+
+        # Build registration command based on runtime type
+        if self.runtime == MCPRuntime.UVX.value:
+            return self._register_uvx(cli, clean_name)
+        elif self.runtime == MCPRuntime.NPX.value:
+            return self._register_npx(cli, clean_name)
+        elif self.runtime == MCPRuntime.DOCKER.value:
+            return self._register_docker(cli, clean_name)
+        elif self.runtime == MCPRuntime.NODE.value:
+            return self._register_node(cli, clean_name)
+        else:  # Python
+            return self._register_python(cli, clean_name)
+
+    def unregister(self, cli: str = "claude") -> bool:
+        """
+        Unregister MCP from specified CLI.
+
+        Args:
+            cli: CLI tool (claude or gemini)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        clean_name = self._get_clean_name()
+
+        if cli != "goose" and not shutil.which(cli):
+            print(f"❌ {cli} CLI not found")
+            return False
+
+        print(f"🗑️  Unregistering '{clean_name}' from {cli}...")
+
+        if cli == "goose":
+            import yaml
+            goose_config_path = Path.home() / ".config" / "goose" / "config.yaml"
+            if not goose_config_path.exists():
+                return True
+            try:
+                with open(goose_config_path, "r") as f:
+                    config = yaml.safe_load(f) or {}
+                if "extensions" in config and clean_name in config["extensions"]:
+                    del config["extensions"][clean_name]
+                    with open(goose_config_path, "w") as f:
+                        yaml.safe_dump(config, f, default_flow_style=False)
+                print(f"✅ Successfully unregistered '{clean_name}' from Goose")
+                self.invalidate_status_cache(cli)
+                return True
+            except Exception as e:
+                print(f"❌ Failed to unregister from Goose: {e}")
+                return False
+
+        try:
+            result = subprocess.run(
+                [cli, "mcp", "remove", clean_name],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+
+            if result.returncode != 0:
+                print(f"❌ Unregistration failed: {result.stderr}")
+                return False
+
+            print(f"✅ Successfully removed '{clean_name}' from {cli}")
+
+            # Invalidate cache since unregistration state changed
+            self.invalidate_status_cache(cli)
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            print("❌ Unregistration timed out")
+            return False
+        except Exception as e:
+            print(f"❌ Unregistration failed: {e}")
+            return False
+
+    def _get_server_command_array(self) -> List[str]:
+        """Returns the command array to run the MCP server, resolving all paths."""
+        import os
+        from pathlib import Path
+
+        cmd_array = []
+        if self.runtime == MCPRuntime.UVX.value:
+            cmd_array = ["uvx"] + self.server_args
+        elif self.runtime == MCPRuntime.NPX.value:
+            cmd_array = ["npx"] + self.server_args
+        elif self.runtime == MCPRuntime.DOCKER.value:
+            if not self.docker_image:
+                print(f"❌ No docker_image specified for '{self.name}'")
+                return []
+            image = self._resolve_docker_image() or self.docker_image
+            cmd_array = ["docker", "run", "-i", "--rm"]
+            cmd_array.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+            cmd_array.extend(self.docker_args)
+            
+            # Mount current working directory into container at the same path
+            cwd = os.getcwd()
+            cmd_array.extend(["-v", f"{cwd}:{cwd}"])
+            for vol in self.docker_volumes:
+                cmd_array.extend(["-v", vol])
+            cmd_array.append(image)
+        elif self.runtime == MCPRuntime.NODE.value:
+            if not self.path:
+                print(f"❌ MCP not installed. Run install() first.")
+                return []
+            cmd_array = [self.server_command or "node"]
+            mcp_path = resolve_path(self.path)
+            for arg in self.server_args:
+                arg = arg.replace("$MCP_PATH", str(mcp_path))
+                arg_path = Path(arg)
+                if not arg_path.is_absolute() and (arg.endswith('.js') or arg.endswith('.py') or '/' in arg):
+                    arg = str(mcp_path / arg)
+                cmd_array.append(arg)
+        else:  # Python
+            if not self.path:
+                print(f"❌ MCP not installed. Run install() first.")
+                return []
+            python_cmd = self._find_python_env()
+            cmd_array = [python_cmd]
+            if self.server_command and self.server_args:
+                mcp_path = resolve_path(self.path)
+                for arg in self.server_args:
+                    arg = arg.replace("$MCP_PATH", str(mcp_path))
+                    arg_path = Path(arg)
+                    if not arg_path.is_absolute() and (arg.endswith('.py') or '/' in arg):
+                        arg = str(mcp_path / arg)
+                    cmd_array.append(arg)
+            else:
+                server_path = self._find_server_entry()
+                if not server_path:
+                    print(f"⚠️  Could not find server entry point in: {self.path}")
+                    return []
+                cmd_array.append(str(server_path))
+        return cmd_array
+
+    def _register_goose(self, clean_name: str) -> bool:
+        """Register MCP with Goose config.yaml"""
+        import yaml
+        
+        cmd_array = self._get_server_command_array()
+        if not cmd_array:
+            return False
+            
+        goose_config_path = Path.home() / ".config" / "goose" / "config.yaml"
+        if goose_config_path.exists():
+            try:
+                with open(goose_config_path, "r") as f:
+                    goose_config = yaml.safe_load(f) or {}
+            except Exception as e:
+                print(f"⚠️  Error reading Goose config: {e}")
+                goose_config = {}
+        else:
+            goose_config = {}
+            
+        if not isinstance(goose_config, dict):
+            goose_config = {}
+        if "extensions" not in goose_config or not isinstance(goose_config["extensions"], dict):
+            goose_config["extensions"] = {}
+            
+        goose_config["extensions"][clean_name] = {
+            "name": clean_name,
+            "type": "stdio",
+            "cmd": cmd_array[0],
+            "args": cmd_array[1:],
+            "enabled": True
+        }
+        
+        # Add environment variables if present
+        if self.env_vars:
+            goose_config["extensions"][clean_name]["env"] = self.env_vars
+            
+        goose_config_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(goose_config_path, "w") as f:
+                yaml.safe_dump(goose_config, f, default_flow_style=False)
+            print(f"✅ Successfully registered '{clean_name}' with Goose")
+            
+            # Invalidate status cache
+            self.invalidate_status_cache("goose")
+            return True
+        except Exception as e:
+            print(f"❌ Failed to write Goose config: {e}")
+            return False
+
+    # -------------------------------------------------------------------------
+    # Helper Methods
+    # -------------------------------------------------------------------------
+
+    def _get_clean_name(self) -> str:
+        """Get cleaned name for CLI registration"""
+        return self.name.replace("/", "_").replace("-", "_")
+
+    def _register_uvx(self, cli: str, clean_name: str) -> bool:
+        """Register uvx-based MCP"""
+        cmd = [cli, "mcp", "add", clean_name]
+
+        # Add environment variables
+        for key, value in self.env_vars.items():
+            cmd.extend(["--env", f"{key}={value}"])
+
+        cmd.append("--")
+        cmd.append("uvx")
+        cmd.extend(self.server_args)
+
+        return self._run_register_command(cmd, cli, clean_name)
+
+    def _register_npx(self, cli: str, clean_name: str) -> bool:
+        """Register npx-based MCP"""
+        cmd = [cli, "mcp", "add", clean_name]
+
+        # Add environment variables
+        for key, value in self.env_vars.items():
+            cmd.extend(["--env", f"{key}={value}"])
+
+        cmd.append("--")
+        cmd.append("npx")
+        cmd.extend(self.server_args)
+
+        return self._run_register_command(cmd, cli, clean_name)
+
+    def _register_docker(self, cli: str, clean_name: str) -> bool:
+        """Register Docker-based MCP.
+
+        Prefers local image (e.g. bindcraft_mcp:latest) over registry image
+        for faster container startup.
+        """
+        import os
+
+        if not self.docker_image:
+            print(f"❌ No docker_image specified for '{clean_name}'")
+            return False
+
+        # Resolve which image to use (local preferred)
+        image = self._resolve_docker_image() or self.docker_image
+
+        cmd = [cli, "mcp", "add", clean_name]
+
+        # Add environment variables
+        for key, value in self.env_vars.items():
+            cmd.extend(["--env", f"{key}={value}"])
+
+        cmd.append("--")
+        cmd.extend(["docker", "run", "-i", "--rm"])
+        cmd.extend(["--user", f"{os.getuid()}:{os.getgid()}"])
+        cmd.extend(self.docker_args)
+
+        # Mount current working directory into container at the same path
+        cwd = os.getcwd()
+        cmd.extend(["-v", f"{cwd}:{cwd}"])
+
+        # Mount any additional configured volumes
+        for vol in self.docker_volumes:
+            cmd.extend(["-v", vol])
+
+        cmd.append(image)
+
+        return self._run_register_command(cmd, cli, clean_name)
+
+    def _register_node(self, cli: str, clean_name: str) -> bool:
+        """Register Node.js-based MCP"""
+        if not self.path:
+            print(f"❌ MCP not installed. Run install() first.")
+            return False
+
+        cmd = [cli, "mcp", "add", clean_name]
+
+        # Add environment variables
+        for key, value in self.env_vars.items():
+            cmd.extend(["--env", f"{key}={value}"])
+
+        cmd.append("--")
+        cmd.append(self.server_command or "node")
+
+        # Resolve path to absolute
+        mcp_path = resolve_path(self.path)
+        args = []
+        for arg in self.server_args:
+            # Replace $MCP_PATH placeholder with absolute path
+            arg = arg.replace("$MCP_PATH", str(mcp_path))
+
+            # Convert relative paths to absolute (for .js files and similar)
+            arg_path = Path(arg)
+            if not arg_path.is_absolute() and (arg.endswith('.js') or arg.endswith('.py') or '/' in arg):
+                arg = str(mcp_path / arg)
+
+            args.append(arg)
+
+        cmd.extend(args)
+
+        return self._run_register_command(cmd, cli, clean_name)
+
+    def _register_python(self, cli: str, clean_name: str) -> bool:
+        """Register Python-based MCP"""
+        if not self.path:
+            print(f"❌ MCP not installed. Run install() first.")
+            return False
+
+        # Find Python environment
+        python_cmd = self._find_python_env()
+
+        cmd = [cli, "mcp", "add", clean_name]
+
+        # Add environment variables
+        for key, value in self.env_vars.items():
+            cmd.extend(["--env", f"{key}={value}"])
+
+        cmd.append("--")
+        cmd.append(python_cmd)
+
+        if self.server_command and self.server_args:
+            # Use specified server command and args
+            # Resolve path to absolute
+            mcp_path = resolve_path(self.path)
+            args = []
+            for arg in self.server_args:
+                # Replace $MCP_PATH placeholder with absolute path
+                arg = arg.replace("$MCP_PATH", str(mcp_path))
+
+                # Convert relative paths to absolute
+                arg_path = Path(arg)
+                if not arg_path.is_absolute() and (arg.endswith('.py') or '/' in arg):
+                    arg = str(mcp_path / arg)
+
+                args.append(arg)
+            cmd.extend(args)
+        else:
+            # Auto-detect server entry point
+            server_path = self._find_server_entry()
+            if not server_path:
+                print(f"⚠️  Could not find server entry point in: {self.path}")
+                return False
+            cmd.append(str(server_path))
+
+        return self._run_register_command(cmd, cli, clean_name)
+
+    def _run_register_command(self, cmd: List[str], cli: str, clean_name: str) -> bool:
+        """Execute registration command"""
+        print(f"   Command: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+
+            if result.returncode != 0:
+                print(f"❌ Registration failed: {result.stderr}")
+                return False
+
+            print(f"✅ Successfully registered '{clean_name}' with {cli}")
+            print(f"\n   Verify with: {cli} mcp list")
+            print(f"   Remove with: {cli} mcp remove {clean_name}")
+
+            # Invalidate cache since registration state changed
+            self.invalidate_status_cache(cli)
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            print("❌ Registration timed out")
+            return False
+        except Exception as e:
+            print(f"❌ Registration failed: {e}")
+            return False
+
+    def _find_server_entry(self) -> Optional[Path]:
+        """Find MCP server entry point"""
+        if not self.path:
+            return None
+
+        mcp_path = resolve_path(self.path)
+
+        # Common locations
+        candidates = [
+            mcp_path / "src" / "server.py",
+            mcp_path / "server.py",
+            mcp_path / "src" / "index.py",
+            mcp_path / "index.py",
+            mcp_path / "main.py",
+            mcp_path / "src" / "main.py",
+        ]
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        # Search for any server.py or main.py
+        for pattern in ["**/server.py", "**/main.py", "**/index.py"]:
+            matches = list(mcp_path.glob(pattern))
+            if matches:
+                return matches[0]
+
+        return None
+
+    def _find_python_env(self) -> str:
+        """Find Python executable"""
+        if not self.path:
+            return "python"
+
+        mcp_path = resolve_path(self.path)
+
+        # Check for local environments
+        env_candidates = [
+            mcp_path / "env" / "bin" / "python",
+            mcp_path / ".venv" / "bin" / "python",
+            mcp_path / "venv" / "bin" / "python",
+        ]
+
+        for env in env_candidates:
+            if env.exists():
+                return str(env)
+
+        # Fall back to system python
+        return "python"
+
+    # -------------------------------------------------------------------------
+    # Serialization Methods
+    # -------------------------------------------------------------------------
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert MCP to dictionary"""
+        return {k: v for k, v in asdict(self).items() if v is not None}
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'MCP':
+        """Create MCP from dictionary"""
+        return cls(**data)
+
+    def __repr__(self) -> str:
+        status = self.get_status()
+        return f"MCP(name='{self.name}', runtime={self.runtime}, status={status.value})"

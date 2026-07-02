@@ -1,0 +1,37 @@
+skills:
+  fitness_modeling:
+    description: Build and compare protein fitness prediction models using ESM, ProtTrans,
+      EV+OneHot, and PLMC backbones. Includes MSA generation, model training, and
+      performance comparison visualization.
+    file_path: workflow-skills/fitness_modeling.md
+    required_mcps:
+    - msa_mcp
+    - plmc_mcp
+    - ev_onehot_mcp
+    - esm_mcp
+    - prottrans_mcp
+  binder_design:
+    description: Design protein binders using BindCraft with GPU-accelerated deep
+      learning for de novo binder generation
+    file_path: workflow-skills/binder_design.md
+    required_mcps:
+    - bindcraft_mcp
+  nanobody_design:
+    description: Design nanobody CDR regions using BoltzGen with optimized cysteine
+      filtering for single-domain antibodies (VHH)
+    file_path: workflow-skills/nanobody_design.md
+    required_mcps:
+    - boltzgen_mcp
+  mcp_docker_debug:
+    description: Debug and fix Docker build failures in MCP repositories. Identifies
+      root causes (permissions, dependencies, compilation errors, network issues)
+      and implements fixes. Monitors GitHub Actions builds and verifies solutions.
+    file_path: mcp-skills/mcp_docker_debug.md
+    required_mcps: []
+  mcp_creation_validator:
+    description: Create new MCPs with validated Docker builds. Provides systematic
+      checklist for repository setup, Dockerfile creation, GitHub Actions workflows,
+      local testing, and final validation. Ensures consistent quality and successful
+      builds across all MCPs.
+    file_path: mcp-skills/mcp_creation_validator.md
+    required_mcps: []

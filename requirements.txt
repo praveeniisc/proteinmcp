@@ -1,0 +1,7 @@
+loguru
+click
+fastmcp
+requests
+PyYAML
+matplotlib
+seaborn
